@@ -1,0 +1,1112 @@
+                                      1 ; ASSEMBLER CODE: INTEL 8051 device STC15W104
+                                      2 ; SDCC SDAS8051 ASSEMBLER
+                                      3 ; BIT_BANG UART     8 bit data, no-parity, 1 stop bit, 19200 baud, Interrupt Driven, full duplex
+                                      4 ; INT4   Start-bit edge detect (P3.0)
+                                      5 ; Timer 0 Data Reception   (high priority)
+                                      6 ; Timer 2 Data Transmission
+                                      7 ;
+                                      8 ; Optimized / verified revision. Changes against the original driver:
+                                      9 ;  - FIX: RX state table entry SWRX_S10 used SWTX_STATE_TABLE as base, a framing
+                                     10 ;    error or BREAK jumped into the middle of the Timer2 ISR (crash).
+                                     11 ;  - RX and TX are fully independent: INT4 stays armed while TX runs, so
+                                     12 ;    back-to-back frames are never lost (RX_OPENBUFF once, then RX_BLIND/RX_POLL).
+                                     13 ;  - 16 byte RX ring buffer (RXBUFFER) with overflow flag SWBFF.
+                                     14 ;  - Start bit is validated at mid-bit (hardware-UART style noise rejection).
+                                     15 ;  - Framing error / BREAK handled at the stop-bit sample, no extra polling state:
+                                     16 ;    INT4 is falling-edge, so re-arming it with the line held low is harmless.
+                                     17 ;  - Jump tables replaced by a down counter: shorter ISRs, no DPTR/B/R0 saves.
+                                     18 ;  - Line is sampled (RX) / driven (TX) as the first instruction after PUSH PSW,
+                                     19 ;    so the timing is fixed and independent of the state being processed.
+                                     20 ;  - TX: start bit is driven by TX_TRANSMIT itself (no idle bit time before the
+                                     21 ;    frame) and STXBSY is released only after the full stop bit: 10 bit times per
+                                     22 ;    byte, back-to-back.
+                                     23 ;  - SWTI now means "transmission complete" (it was also set at the start bit).
+                                     24 ;  - Baud divisor is rounded instead of truncated.
+                                     25 
+                                     26 .module bb_uart_drv
+                                     27 
+                                     28 .optsdcc -mmcs51 --model-small -iram-size 128 --xram-size 0 --code-size 4088
+                                     29 
+                                     30 .include "stc15w-sdcc.inc"			; STC15W104 Processor header file
+                                      1 ; STC15W series
+                                      2 ; Special Function Registers
+                                      3 ; Special Function Register Map and Defines
+                                      4 ;
+                                      5 ; Verification Date: 2026-08-12 - reviewed for errors, matches documentation 
+                                      6 ; STC15W408AS-STC15F2K60S2-en.pdf Update Date: 2015/10/10
+                                      7 
+                                      8 
+                           000080     9 P0 .equ 0x80                  ; P0,	I/O port 0,	(Bit-Addressable)
+                           000087    10 	P07 .equ 0x80+7             
+                           000086    11 	P06 .equ 0x80+6             
+                           000085    12 	P05 .equ 0x80+5             
+                           000084    13 	P04 .equ 0x80+4             
+                           000083    14 	P03 .equ 0x80+3             
+                           000082    15 	P02 .equ 0x80+2             
+                           000081    16 	P01 .equ 0x80+1             
+                           000080    17 	P00 .equ 0x80+0             
+                                     18 
+                           000081    19 SP .equ 0x81                  ; SP, stack pointer, (Non bit-Addressable)
+                                     20 
+                           000082    21 DPL .equ 0x82                 ; DPL, data pointer low, (Non bit-Addressable)
+                                     22 					
+                           000083    23 DPH .equ 0x83                 ; DPH, data pointer high, (Non bit-Addressable)
+                                     24 
+                           000084    25 S4CON .equ 0x84               ; S4CON register: Serial Port 4 (UART4) Control Register (No bit-Addressable)
+                           000080    26 	S4SM0	.equ	0x80	  ;b7, S4SM0  
+                           000040    27 	S4ST4	.equ	0x40	  ;b6, S4ST4 
+                           000020    28 	S4SM2	.equ	0x20	  ;b5, S4SM2 
+                           000010    29 	S4REN	.equ	0x10	  ;b4, S4REN 
+                           000008    30 	S4TB8	.equ	0x08	  ;b3, S4TB8 
+                           000004    31 	S4RB8	.equ	0x04	  ;b2, S4RB8 
+                           000002    32 	S4TI 	.equ	0x02	  ;b1, S4TI  
+                           000001    33 	S4RI 	.equ	0x01	  ;b0, S4RI  
+                                     34 
+                           000085    35 S4BUF .equ 0x85               ; S4, serial buffer, (Non bit-addressable)
+                                     36 
+                                     37 ; 0x86 empty
+                                     38 
+                           000087    39 PCON .equ 0x87                ; LVD interrupt: Power Control register PCON (Non bit-Addressable)
+                                     40 	;
+                           000080    41 	SMOD	.equ	0x80	  ;b7, SMOD	double Baud rate control bit.
+                           000040    42 	SMOD0	.equ	0x40	  ;b6, SMOD0 Frame Error select.
+                           000020    43 	LVDF	.equ	0x20	  ;b5, LVDF	Low-Voltage Flag.
+                           000010    44 	POF		.equ	0x10	  ;b4, POF	Power-On flag. It is set by power-off-on action and can only cleared by software.
+                           000008    45 	GF1		.equ	0x08	  ;b3, GF1	General-purposed flag 1
+                           000004    46 	GF0		.equ	0x04	  ;b2, GF0	General-purposed flag 0
+                           000002    47 	PD		.equ	0x02	  ;b1, PD	Power-Down bit.
+                           000001    48 	IDL		.equ	0x01	  ;b0, IDL	Idle mode bit.
+                                     49 
+                           000088    50 TCON .equ 0x88                ; TCON, Timer/Counter Control Register (Bit-Addressable)
+                                     51 	;
+                           00008F    52 	TF1 .equ 0x88+7           ; Timer 1 overflows the interrupt mark bit
+                           00008E    53 	TR1 .equ 0x88+6           ; Timer 1 runs the control bit
+                           00008D    54 	TF0 .equ 0x88+5           ; Timer 0 overflows the interrupt flag bit
+                           00008C    55 	TR0 .equ 0x88+4           ; Timer 0 runs the control bit
+                           00008B    56 	IE1 .equ 0x88+3           ; Outer interruption 1 marker
+                           00008A    57 	IT1 .equ 0x88+2           ; Outer interruption 1 signal mode control level, 1: falling edge interruption, 0: rising and falling are all interrupted.
+                           000089    58 	IE0 .equ 0x88+1           ; The 0 marker is interrupted outside
+                           000088    59 	IT0 .equ 0x88+0           ; The outer interruption of the 0 signal mode control level, 1: the falling edge is interrupted, and 0: the rising and falling are all interrupted.
+                                     60 
+                           000089    61 TMOD .equ 0x89                ; TMOD, Timer/Counter Mode Register (Non bit-addressable)
+                                     62 	;
+                           000080    63 	GATE 	.equ	0x80	  ; b7, T1 GATE 	Timer/Counter 1 Gate Control.
+                           000040    64 	CT1		.equ	0x40	  ; b6, T1 C/-T	Timer/Counter 1 Select bit.
+                           000020    65 	M1		.equ	0x20	  ; b5, T1 M1	Timer 1 Mode Select bits.
+                           000010    66 	M0		.equ	0x10	  ; b4, T1 M0
+                           000008    67 	GATE	.equ	0x08	  ; b3, T0 GATE	Timer/Counter 0 Gate Control.
+                           000004    68 	CT0		.equ	0x04	  ; b2, T0 C/-T	Timer/Counter 0 Select bit.
+                           000002    69 	M1		.equ	0x02	  ; b1, T0 M1	Timer 0 Mode Select bits.
+                           000001    70 	M0		.equ	0x01	  ; b0, T0 M0
+                                     71 
+                           00008A    72 TL0 .equ 0x8A                 ; TL0, Timer 0 low byte Register  (Non bit-addressable)
+                                     73 
+                           00008B    74 TL1 .equ 0x8B                 ; TL1, Timer 1 low byte Register  (Non bit-addressable)
+                                     75 
+                           00008C    76 TH0 .equ 0x8C                 ; TH0, Timer 0 high byte Register  (Non bit-addressable)
+                                     77 
+                           00008D    78 TH1 .equ 0x8D                 ; TH1, Timer 1 high byte Register  (Non bit-addressable)
+                                     79 
+                           00008E    80 AUXR .equ 0x8E                ; AUXR, Auxiliary register (Non bit-addressable)
+                                     81 	;
+                           000080    82 	T0x12		.equ	0x80	  ; b7, T0x12, Timer 0 clock source bit.				
+                           000040    83 	T1x12		.equ	0x40	  ; b6, T1x12, Timer 1 clock source bit.
+                           000020    84 	UART_M0x6	.equ	0x20	  ; b5, UART_M0x6, Baud rate select bit of UART1 while it is working under Mode-0
+                           000010    85 	T2R			.equ	0x10	  ; b4, T2R, Timer 2 Run control bit
+                           000008    86 	T2_CT2		.equ	0x08	  ; b3, T2_C/T, Counter or timer 2 selector
+                           000004    87 	T2x12		.equ	0x04	  ; b2, T2x12, Timer 2 clock source bit.
+                           000002    88 	EXTRAM		.equ	0x02	  ; b1, EXTRAM, Internal / external RAM access control bit.
+                           000001    89 	S1ST2		.equ	0x01	  ; b0, S1ST2, the control bit that UART1 select Timer 2 as its baud-rate generator.
+                                     90 
+                                     91 ; WAKE_CLKO .equ 0x8F ; NOT STC15W1xx
+                                     92           
+                           00008F    93 INT_CLKO .equ 0x8F            
+                           00008F    94 AUXR2 .equ 0x8F            
+                                     95 	;
+                                     96 	;		.equ	0x80	  ; b7, -
+                           000040    97 	EX4		.equ	0x40	  ; b6, EX4					; EX4, Enable bit of External Interrupt 4 (INT4)
+                           000020    98 	EX3		.equ	0x20	  ; b5, EX3					; EX3, Enable bit of External Interrupt 3 (INT3)
+                           000010    99 	EX2		.equ	0x10	  ; b4, EX2					; EX2, Enable bit of External Interrupt 2 (INT2)
+                                    100 	;		.equ	0x08	  ; b3, -
+                           000004   101 	T2CLKO	.equ	0x04	  ; b2, T2CLKO				; Timer 2(T2) programmable clock output T2CLKO
+                           000002   102 	T1CLKO	.equ	0x02	  ; b1, T1CLKO				; T0 configured for Timer 1(T1) programmable clock output T1CLKO
+                           000001   103 	T0CLKO	.equ	0x01	  ; b0, T0CLKO				; T1 configured for Timer 0(T0) programmable clock output T0CLKO
+                                    104 
+                           000090   105 P1 .equ 0x90                  ; P1,	I/O port 0, (Bit-Addressable)
+                           000097   106 	P17 .equ 0x90+7             
+                           000096   107 	P16 .equ 0x90+6             
+                           000095   108 	P15 .equ 0x90+5             
+                           000094   109 	P14 .equ 0x90+4             
+                           000093   110 	P13 .equ 0x90+3             
+                           000092   111 	P12 .equ 0x90+2             
+                           000091   112 	P11 .equ 0x90+1             
+                           000090   113 	P10 .equ 0x90+0             
+                                    114 
+                           000091   115 P1M1 .equ 0x91                ; P1M1 register (non bit addressable)
+                           000092   116 P1M0 .equ 0x92                ; P1M0 register (non bit addressable)
+                                    117 	; Configure I/O ports mode
+                                    118 	; [P1M1.b, P1M0.b]:{0,0} Quasi_bidirectional,Sink Current up to 20mA, 	
+                                    119 	;				   {0,1} Push-pull output, 20mA
+                                    120 	;				   {1,0} Input-only (high-impedance )
+                                    121 	;				   {1,1} Open Drain, no internal pull-up resister
+                                    122 	; Example: MOV P1M1, #10100000B
+                                    123 	;          MOV P1M0, #11000000B
+                                    124 	; P1.7 in Open Drain mode, P1.6 in strong push-pull output, P1.5 in high-impedance input, P1.4-0 quasi_bidirectional
+                                    125 	
+                           000093   126 P0M1 .equ 0x93                ; P0M1 register (non bit addressable)
+                           000094   127 P0M0 .equ 0x94                ; P0M0 register (non bit addressable)
+                                    128 	; Configure I/O ports mode
+                                    129 
+                           000095   130 P2M1 .equ 0x95                ; P2M1 register (non bit addressable)
+                           000096   131 P2M0 .equ 0x96                ; P2M0 register (non bit addressable)
+                                    132 	; Configure I/O ports mode
+                                    133 
+                           000097   134 CLK_DIV .equ 0x97             ; CLK_DIV (PCON2) : Clock Division register (Non bit addressable
+                           000097   135 PCON2 .equ 0x97               ;
+                                    136 	;
+                           000080   137 	MCK0_S1	.equ	0x80	  ; b7, MCK0_S1			; Master clock output external clock
+                           000040   138 	MCK0_S0	.equ	0x40	  ; b6, MCK0_S0
+                           000020   139 	ADRJ	.equ	0x20	  ; b5, ADRJ			; ADC Result Arrangement Register Bit ----ADRJ
+                           000010   140 	Tx_Rx	.equ	0x10	  ; b4, Tx_Rx			; Tx_Rx:the set bit of relay and broadcast mode of UART1 
+                           000008   141 	MCLK0_2	.equ	0x08	  ; b3, MCLK0_2 		; MCLKO_2:to select Master Clock output on where
+                           000004   142 	CLKS2	.equ	0x04	  ; b2, CLKS2			; Master clock frequency/(b2-b1), System Clock(SYSclk) Division
+                           000002   143 	CLKS1	.equ	0x02	  ; b1, CLKS1
+                           000001   144 	CLKS0	.equ	0x01	  ; b0, CLKS0
+                                    145 
+                                    146 
+                           000098   147 SCON .equ 0x98                ; Serial Port 1 Control Register (Bit-Addressable)
+                                    148 	;
+                           00009F   149 	FE  .equ 0x98+7           ; Framing Error (SM0/FE) FE : Framing Error bit. 
+                           00009F   150 	SM0 .equ 0x98+7           ; Serial Mode 0 (SM0/FE) The SMOD0 bit must be set to enable access to the FE bit
+                           00009E   151 	SM1 .equ 0x98+6           ; Serial Mode 1
+                           00009D   152 	SM2 .equ 0x98+5           ; Serial Mode 2
+                           00009C   153 	REN .equ 0x98+4           ; Receive Enable
+                           00009B   154 	TB8 .equ 0x98+3           ; Transmit Bit 8
+                           00009A   155 	RB8 .equ 0x98+2           ; Receive Bit 8
+                           000099   156 	TI 	.equ 0x98+1           ; Transmit Interrupt
+                           000098   157 	RI 	.equ 0x98+0           ; Receive Interrupt
+                                    158 ;
+                           000099   159 SBUF .equ 0x99                ; Serial Port 1 Data Buffer Register
+                                    160 
+                           00009A   161 S2CON .equ 0x9A               ; Serial Port 2 (UART2) Control Register (No bit-Addressable)
+                                    162 	;
+                           000080   163 	S2SM0	.equ	0x80	  ; b7, S2SM0			; 8,9-bit UART, baud-rate variable
+                                    164 	;-		.equ	0x40	  ; b6, -
+                           000020   165 	S2SM2	.equ	0x20	  ; b5, S2SM2			; Enable the automatic address recognition feature.
+                           000010   166 	S2REN	.equ	0x10	  ; b4, S2REN			; Enable the serial port reception.
+                           000008   167 	S2TB8	.equ	0x08	  ; b3, S2TB8			; 9th data bit which will be transmitted in mode 1.
+                           000004   168 	S2RB8	.equ	0x04	  ; b2, S2RB8			; In mode 1, the received 9th data bit will go into this bit.
+                           000002   169 	S2TI	.equ	0x02	  ; b1, S2TI			; Transmit interrupt flag.
+                           000001   170 	S2RI	.equ	0x01	  ; b0, S2RI			; Receive interrupt flag.
+                                    171 ;
+                           00009B   172 S2SBUF .equ 0x9B                ; Serial Port 2 Data Buffer Register
+                                    173 
+                           00009C   174 BRT .equ 0x9C                 ; dedicated Baud-Rate Timer, unavialable Datasheet Error?
+                                    175 
+                           00009D   176 P1ASF .equ 0x9D               ; P1 Analog Function Configure register: P1ASF (Non bit-addressable)
+                                    177 	;
+                                    178 	; b7, P17ASF, 0x80 		  ; Set(1) P1.x as ADC input channel-x
+                                    179 	; b6, P16ASF, 0x40 		  ;
+                                    180 	; b5, P15ASF, 0x20 		  ;
+                                    181 	; b4, P14ASF, 0x10 		  ;
+                                    182 	; b3, P13ASF, 0x08 		  ;
+                                    183 	; b2, P12ASF, 0x04 		  ;
+                                    184 	; b1, P11ASF, 0x02 		  ;
+                                    185 	; b0, P10ASF, 0x01 		  ;
+                                    186 
+                                    187 ; 0x9E	not used
+                                    188 ; 0x9F	not used
+                                    189 
+                           0000A0   190 P2 .equ 0xA0                  ; P2,	I/O port 0, (Bit-Addressable)
+                           0000A7   191 	P27 .equ 0xA0+7             
+                           0000A6   192 	P26 .equ 0xA0+6             
+                           0000A5   193 	P25 .equ 0xA0+5             
+                           0000A4   194 	P24 .equ 0xA0+4             
+                           0000A3   195 	P23 .equ 0xA0+3             
+                           0000A2   196 	P22 .equ 0xA0+2             
+                           0000A1   197 	P21 .equ 0xA0+1             
+                           0000A0   198 	P20 .equ 0xA0+0             
+                                    199 
+                           0000A1   200 BUS_SPEED .equ 0xA1           ;xxxx,xx10 Bus Speed Control Register (Non bit-addressable)
+                                    201 	;	
+                                    202 	; 		.equ	0x80	  ; b7, - 		
+                                    203 	; 		.equ	0x40	  ; b6, - 		
+                                    204 	; 		.equ	0x20	  ; b5, - 		
+                                    205 	; 		.equ	0x10	  ; b4, - 		
+                                    206 	; 		.equ	0x08	  ; b3, - 		
+                                    207 	; 		.equ	0x04	  ; b2, - 		
+                           000002   208 	EXRTS1	.equ	0x02	  ; b1, EXRTS1 	(Extend Ram Timing Selector)
+                           000001   209 	EXRTS0	.equ	0x01	  ; b0, EXRTS0 	
+                                    210 		
+                           0000A2   211 AUXR1 .equ 0xA2               			; Auxiliary register 1 (Non bit-addressable)
+                           0000A2   212 P_SW1 .equ 0xA2               			; Auxiliary register 1
+                                    213 	;		
+                           000080   214 	S1_S1 	.equ	0x80; b7, S1_S1 	; UART1/S1-0 can be switched between P1 and P3
+                           000040   215 	S1_S0 	.equ	0x40; b6, S1_S0 	;
+                           000020   216 	CCP_S1	.equ	0x20; b5, CCP_S1 	; CCP can be switched in P1 and P2 and P3
+                           000010   217 	CCP_S0	.equ	0x10; b4, CCP_S0 	;	
+                           000008   218 	SPI_S1	.equ	0x08; b3, SPI_S1 	; SPI can be switched in P1 and P2 and P4
+                           000004   219 	SPI_S0	.equ	0x04; b2, SPI_S0	;
+                                    220 	;		.equ	0x02; b1, -	
+                           000001   221 	DPS		.equ	0x01; b0, DPS		; DPTR registers select bit.
+                                    222 	
+                                    223 ; 0xA3	not used
+                                    224 ; 0xA4	not used
+                                    225 ; 0xA5	not used
+                                    226 ; 0xA6	not used
+                                    227 ; 0xA7	not used
+                                    228 
+                           0000A8   229 IE .equ 0xA8                  ; Interrupt Control Register (Bit-Addressable)
+                           0000AF   230 	EA   .equ 0xA8+7;         ;
+                           0000AE   231 	ELVD .equ 0xA8+6;         ;
+                           0000AD   232 	EADC .equ 0xA8+5;         ;
+                           0000AC   233 	ES   .equ 0xA8+4;         ;
+                           0000AB   234 	ET1  .equ 0xA8+3;         ;
+                           0000AA   235 	EX1  .equ 0xA8+2;         ;
+                           0000A9   236 	ET0  .equ 0xA8+1;         ;
+                           0000A8   237 	EX0  .equ 0xA8+0;         ;
+                                    238 
+                           0000A9   239 SADDR .equ 0xA9;              ; Slave Address Register, (Non bit-addressable)
+                                    240 
+                           0000AA   241 WKTCL .equ 0xAA               ; Power-Down Wake-up Timer Control register, low byte, (Non bit-addressable)
+                           0000AA   242 WKTCL_CNT .equ 0xAA           ; Power Down Wakeup Timer Control High Byte, low byte
+                                    243 
+                           0000AB   244 WKTCH .equ 0xAB               ; Power-Down Wake-up Timer Control register and enable, high byte, (Non bit-addressable)
+                           0000AB   245 WKTCH_CNH .equ 0xAB               ; Power-Down Wake-up Timer Control register and enable, high byte, (Non bit-addressable)
+                                    246 
+                           0000AC   247 S3CON .equ 0xAC               ; Serial Port 3 Control Register, (Non bit-addressable)
+                                    248 	;
+                           000080   249 	S3SM0	.equ	0x80	  ; b0,  S3SM0 			; Serial Port 3 Select Mode Bit 0
+                           000040   250 	S3ST3	.equ	0x40	  ; b1,  S3ST3 			; Serial Port 3 Select Timer 3
+                           000020   251 	S3SM2	.equ	0x20	  ; b2,  S3SM2 			; Serial Port 3 Select Mode Bit 2
+                           000020   252 	S3REN	.equ	0x20	  ; b3,  S3REN 			; Serial Port 3 Receive Enable
+                           000008   253 	S3TB8	.equ	0x08	  ; b4,  S3TB8 			; Serial Port 3 Transmit Bit 8 Data
+                           000004   254 	S3RB8	.equ	0x04	  ; b5,  S3RB8 			; Serial Port 3 Receive Bit 8 Data
+                           000002   255 	S3TI 	.equ	0x02	  ; b6,  S3TI  			; Serial Port 3 Transmit Interrupt Flag
+                           000001   256 	S3RI 	.equ	0x01	  ; b7,  S3RI  			; Serial Port 3 Receive Interrupt Flag
+                                    257 
+                           0000AD   258 S3BUF .equ 0xAD               ; Serial Port 3 Data Register, (Non bit-addressable)
+                                    259 
+                                    260 ; 0xAE	not used
+                                    261 
+                           0000AF   262 IE2 .equ 0xAF                 ; Interrupt Enable 2 Rsgister (Non bit-addressable)
+                                    263 	;
+                                    264 	;-	
+                           000040   265 	ET4 	.equ	0x40	  ; b6,  ET4 			; Enable Timer 4 Interrupt
+                           000020   266 	ET3 	.equ	0x20	  ; b5,  ET3 			; Enable Timer 3 Interrupt
+                           000010   267 	ES4 	.equ	0x10	  ; b4,  ES4 			; Enable Serial Port 4 Interrupt
+                           000008   268 	ES3 	.equ	0x08	  ; b3,  ES3 			; Enable Serial Port 3 Interrupt
+                           000004   269 	ET2 	.equ	0x04	  ; b2,  ET2 			; Enable Timer 2 Interrupt
+                           000002   270 	ESPI	.equ	0x02	  ; b1,  ESPI			; Enable Serial Peripheral Interface Interrupt
+                           000001   271 	ES2 	.equ	0x01	  ; b0,  ES2 			; Enable Serial Port 2 Interrupt
+                                    272     
+                           0000B0   273 P3 .equ 0xB0                  ; P3,	I/O port 0,	(Bit-Addressable)
+                           0000B7   274 	P37 .equ 0xB0+7             
+                           0000B6   275 	P36 .equ 0xB0+6             
+                           0000B5   276 	P35 .equ 0xB0+5             
+                           0000B4   277 	P34 .equ 0xB0+4             
+                           0000B3   278 	P33 .equ 0xB0+3             
+                           0000B2   279 	P32 .equ 0xB0+2             
+                           0000B1   280 	P31 .equ 0xB0+1             
+                           0000B0   281 	P30 .equ 0xB0+0             
+                                    282 				
+                           0000B1   283 P3M1 .equ 0xB1                ; Port 3 Mode Register 1  (Non bit-addressable)
+                                    284 				
+                           0000B2   285 P3M0 .equ 0xB2                ; Port 3 Mode Register 0  (Non bit-addressable)
+                                    286 
+                           0000B3   287 P4M1 .equ 0xB3                ; Port 4 Mode Register 1  (Non bit-addressable)
+                                    288 
+                           0000B4   289 P4M0 .equ 0xB4                ; Port 4 Mode Register 0  (Non bit-addressable)
+                                    290 
+                                    291 
+                           0000B5   292 IP2 .equ 0xB5                 ; Interrupt Priority Register 2 (Non bit-addressable)
+                                    293 	;		.equ	0x80	  ; b7, -
+                                    294 	;		.equ	0x40	  ; b6, -
+                                    295 	;		.equ	0x20	  ; b5, -
+                                    296 	;		.equ	0x10	  ; b4, -
+                                    297 	;		.equ	0x08	  ; b3, -
+                                    298 	;		.equ	0x04	  ; b2, -	
+                           000002   299 	PSPI	.equ	0x02
+                           000001   300 	PS2		.equ	0x01
+                                    301 	
+                                    302 ; 0xB6	not used
+                                    303 ; 0xB7	not used
+                                    304 
+                           0000B8   305 IP	.equ	0xB8			  ; Interrupt Priority Low
+                                    306 	;
+                           000080   307 	PPCA	.equ	0x80	  ; b7,  PPCA			; Priority Programmable Counter Array
+                           000040   308 	PLVD	.equ	0x40	  ; b6,  PLVD			; Priority Low Voltage Detect
+                           000020   309 	PADC	.equ	0x20	  ; b5,  PADC			; Priority ADC
+                           000010   310 	PS  	.equ	0x10	  ; b4,  PS  			; Priority Serial
+                           000008   311 	PT1 	.equ	0x08	  ; b3,  PT1 			; Priority Timer 1
+                           000004   312 	PX1 	.equ	0x04	  ; b2,  PX1 			; Priority External 1
+                           000002   313 	PT0 	.equ	0x02	  ; b1,  PT0 			; Priority Timer 0
+                           000001   314 	PX0 	.equ	0x01	  ; b0,  PX0 			; Priority External 0
+                                    315 
+                           0000B9   316 SADEN	.equ	0xB9
+                                    317 
+                                    318 
+                           0000BA   319 P_SW2 .equ 0xBA               ; Peripheral function switch register (Non bit-addressable)
+                                    320 	;
+                                    321 	;		.equ	0x80	  ; b7, -
+                                    322 	;		.equ	0x40	  ; b6, -
+                                    323 	;		.equ	0x20	  ; b5, -
+                                    324 	;		.equ	0x10	  ; b4, -
+                                    325 	;		.equ	0x08	  ; b3, -
+                           000004   326 	S4_S	.equ	0x04	  ; b2, S4_S			; UART4/S4 can be switched between P0 and P5
+                           000002   327 	S3_S	.equ	0x02	  ; b1, S3_S			; UART3/S3 can be switched between P0 and P5
+                           000001   328 	S2_S	.equ	0x01	  ; b0, S2_S    		; UART4/S4 can be switched between P0 and P5
+                                    329 
+                                    330 ; 0xBB	not used
+                                    331 
+                           0000BC   332 ADC_CONTR .equ 0xBC           ; ADC Conversion Control Register (Non bit-addressable)
+                                    333 	;
+                           000080   334 	ADC_POWER	.equ	0x80  ; b7, ADC_POWER
+                           000040   335 	SPEED1		.equ	0x40  ; b6, SPEED1			; Times needed by an A/D Coversion
+                           000020   336 	SPEED0		.equ	0x20  ; b5, SPEED0
+                           000010   337 	ADC_FLAG	.equ	0x10  ; b4, ADC_FLAG		; ADC interrupt flag.
+                           000008   338 	ADC_START	.equ	0x08  ; b3, ADC_START		; ADC start bit, which enable ADC conversion.
+                           000004   339 	CHS2		.equ	0x04  ; b2, CHS2			; Select one analog input source from 8 channels.			
+                           000002   340 	CHS1		.equ	0x02  ; b1, CHS1
+                           000001   341 	CHS0 		.equ	0x01  ; b0, CHS0 
+                                    342 
+                           0000BD   343 ADC_RES .equ 0xBD             ; ADC Conversion Result High 8 Bits
+                                    344 
+                           0000BE   345 ADC_RESL .equ 0xBE            ; ADC Conversion Result Low 2 Bits
+                                    346 
+                                    347 ; 0xBF	not used
+                                    348 
+                           0000C0   349 P4 .equ 0xC0                  ; P4,	I/O port 4,	(Bit-Addressable)
+                           0000C7   350 	P47 .equ 0xC0+7             
+                           0000C6   351 	P46 .equ 0xC0+6             
+                           0000C5   352 	P45 .equ 0xC0+5             
+                           0000C4   353 	P44 .equ 0xC0+4             
+                           0000C3   354 	P43 .equ 0xC0+3             
+                           0000C2   355 	P42 .equ 0xC0+2             
+                           0000C1   356 	P41 .equ 0xC0+1             
+                           0000C0   357 	P40 .equ 0xC0+0             
+                                    358 
+                           0000C1   359 WDT_CONTR .equ 0xC1           ; Watchdog Control Register (Non bit-addressable)
+                                    360 	;
+                           000080   361 	WDT_FLAG	.equ	0x80  ; b7, WDT_FLAG		; WDT reset flag. 1 timer overflow
+                                    362 	;-			.equ	0x40  ; b6, -
+                           000020   363 	EN_WDT		.equ	0x20  ; b5, EN_WDT			; Enable WDT bit. When set, WDT is started.
+                           000010   364 	CLR_WDT		.equ	0x10  ; b4, CLR_WDT			; WDT clear bit. When set, WDT will recount. Hardware will automatically clear this bit.
+                           000008   365 	IDLE_WDT	.equ	0x08  ; b3, IDLE_WDT		; WDT IDLE mode bit. When set, WDT is enabled in IDLE mode.
+                           000004   366 	PS2			.equ	0x04  ; b2, PS2				; WDT Pre-scale value set bit. 0 div2, 7 div256
+                           000002   367 	PS1			.equ	0x02  ; b1, PS1
+                           000001   368 	PS0			.equ	0x01  ; b0, PS0
+                                    369 
+                           0000C2   370 IAP_DATA .equ 0xC2            ; In Application Programming Data, Flash data register low (Non bit-addressable)
+                           0000C2   371 ISP_DATA .equ 0xC2            ; In System Programming, Flash data register low (Non bit-addressable)
+                                    372 
+                           0000C3   373 IAP_ADDRH .equ 0xC3           ; In Application Programming Address High (Non bit-addressable)
+                           0000C3   374 ISP_ADDRH .equ 0xC3           ; In System Programming Address High (Non bit-addressable)
+                                    375 
+                           0000C4   376 IAP_ADDRH .equ 0xC4           ; In Application Programming Address Low (Non bit-addressable)
+                           0000C4   377 ISP_ADDRH .equ 0xC4           ; In System Programming Address Low (Non bit-addressable)
+                                    378 
+                           0000C5   379 IAP_CMD .equ 0xC5             ; ISP/IAP Flash Command Register : IAP_CMD (Non bit -addressable)
+                           0000C5   380 ISP_CMD .equ 0xC5             ; In System Programming Command,   IAPCMD = 0x03 ;In Application Programming Command
+                                    381 	;
+                                    382 	;		.equ	0x80	  ; b7, -
+                                    383 	;		.equ	0x40	  ; b6, -
+                                    384 	;		.equ	0x20	  ; b5, -
+                                    385 	;		.equ	0x10	  ; b4, -
+                                    386 	;		.equ	0x08	  ; b3, -
+                                    387 	;		.equ	0x04	  ; b2, -
+                           000002   388 	MS1		.equ	0x02	  ; b1, MS1				; MS1, MS0 : ISP/IAP operating mode selection. 
+                           000001   389 	MS0		.equ	0x01	  ; b0, MS0				; IAP_CMD is used to select the flash mode
+                                    390 	; Valid IAP/ISP commands follow
+                                    391 		; IAP_ERASE = 0x03
+                                    392 		; IAP_WRITE = 0x02
+                                    393 		; IAP_READ  = 0x01
+                                    394 		; IAP_IDL   = 0x00
+                                    395 	; End of valid commands
+                                    396 
+                           0000C6   397 IAP_TRIG .equ 0xC6            ; ISP/IAP Flash Command Trigger Register : IAP_TRIG (Address: C6H, (Non bit -addressable)
+                                    398 
+                           0000C7   399 IAP_CONTR .equ 0xC7           ; ISP/IAP Control Register : IAP_CONTR (Non bit-addressable)
+                           0000C7   400 ISP_CONTR .equ 0xC7           ; In System Programming Control
+                                    401 	;
+                           000080   402 	IAPEN		.equ	0x80	  ; b7, IAPEN			; In Application Programming Enable
+                           000040   403 	SWBS 		.equ	0x40	  ; b6, SWBS 			; Software Boot Selection
+                           000020   404 	SWRST		.equ	0x20	  ; b5, SWRST			; Software Reset Trigger
+                           000010   405 	CMD_FAIL	.equ	0x10	  ; b4, CMD_FAIL		; Command Fail
+                           000008   406 	IAP_WT		.equ	0x08	  ; b3, IAP_WT			; ??? In Application Programming Wait
+                           000004   407 	WT2			.equ	0x04	  ; b2, WT2				; WT2~WT0 : Waiting time selection while flash is busy.
+                           000002   408 	WT1			.equ	0x02	  ; b1, WT1
+                           000001   409 	WT0			.equ	0x01	  ; b0, WT0
+                                    410 
+                           0000C8   411 P5 .equ 0xC8                  ; P5,	I/O port 0,	(Bit-Addressable)
+                           0000CF   412 	P57 .equ 0xC8+7             
+                           0000CE   413 	P56 .equ 0xC8+6             
+                           0000CD   414 	P55 .equ 0xC8+5             
+                           0000CC   415 	P54 .equ 0xC8+4             
+                           0000CB   416 	P53 .equ 0xC8+3             
+                           0000CA   417 	P52 .equ 0xC8+2             
+                           0000C9   418 	P51 .equ 0xC8+1             
+                           0000C8   419 	P50 .equ 0xC8+0             
+                                    420 	
+                           0000C9   421 P5M1 .equ 0xC9                ; P5M1 register (non bit addressable)
+                           0000CA   422 P5M0 .equ 0xCA                ; P5M0 register (non bit addressable)
+                                    423 	; Configure I/O ports mode
+                                    424 
+                           0000CB   425 P6M1 .equ 0xCB                ; P5M1 register (non bit addressable)
+                           0000CC   426 P6M0 .equ 0xCC                ; P5M0 register (non bit addressable)
+                                    427 	; Configure I/O ports mode
+                                    428 	
+                           0000CD   429 SPSTAT .equ 0xCD              ; Serial Peripheral Status Register (non bit addressable)
+                                    430 	;
+                           000080   431 	SPIF	.equ	0x80	  ; b7, SPIF				;Serial Peripheral Interface Flag
+                           000040   432 	WCOL	.equ	0x40	  ; b6, WCOL				;Write Collision
+                                    433 	;		.equ	0x20	  ; b5, -
+                                    434 	;		.equ	0x10	  ; b4, -
+                                    435 	;		.equ	0x08	  ; b3, -
+                                    436 	;		.equ	0x04	  ; b2, - 
+                                    437 	;		.equ	0x02	  ; b1, -
+                                    438 	;		.equ	0x01	  ; b0, -
+                                    439 	
+                           0000CE   440 SPCTL .equ 0xCE;              ; Serial Peripheral Control (non bit addressable)
+                                    441 	;
+                           000080   442 	SSIG	.equ	0x80	  ; b7, SSIG				; Control whether SS pin is ignored or not.
+                           000040   443 	SPEN	.equ	0x40	  ; b6, SPEN				; SPI enable bit.
+                           000020   444 	DORD	.equ	0x20	  ; b5, DORD				; Set the transmitted or received SPI data order.
+                           000010   445 	MSTR	.equ	0x10	  ; b4, MSTR				; Master/Slave mode select bit.
+                           000008   446 	CPOL	.equ	0x08	  ; b3, CPOL				; SPI clock polarity select bit.
+                           000004   447 	CPHA	.equ	0x04	  ; b2, CPHA				; SPI clock phase select bit.
+                           000002   448 	SPR1	.equ	0x02	  ; b1, SPR1				; SPR1-SPR0 : SPI clock rate select bit (when in master mode)
+                           000001   449 	SPR0	.equ	0x01	  ; b0, SPR0				; 
+                                    450 	
+                           0000CF   451 SPDAT .equ 0xCF               ; Serial Peripheral Data Register (non bit addressable)
+                                    452 
+                           0000D0   453 PSW .equ 0xD0                 ; Program status word
+                           0000D7   454 	CY 	.equ 0xD0+7           ; Carry
+                           0000D6   455 	AC 	.equ 0xD0+6           ; Auxiliary Carry
+                           0000D5   456 	F0 	.equ 0xD0+5           ; Flag 0
+                           0000D4   457 	RS1 .equ 0xD0+4           ; Register Select 1
+                           0000D3   458 	RS0 .equ 0xD0+3           ; Register Select 0
+                           0000D2   459 	OV 	.equ 0xD0+2           ; Overflow
+                           0000D1   460 	F1 	.equ 0xD0+1           ; Flag 1
+                           0000D0   461 	P 	.equ 0xD0+0           ; Parity
+                                    462 	
+                           0000D1   463 T4T3M .equ 0xD1               ; T3/T4 Mode Register (non bit addressable)
+                                    464 	;
+                           000080   465 	T4R   	.equ	0x80	  ; b7, T4R    				; Timer 4 Run Control
+                           000040   466 	T4_CT 	.equ	0x40	  ; b6, T4_CT  				; Timer 4 Counter or Timer Mode Select
+                           000020   467 	T4x12 	.equ	0x20	  ; b5, T4x12  				; Timer 4 Clock x12 Prescaler Bypass
+                           000010   468 	T4CLKO	.equ	0x10	  ; b4, T4CLKO 				; Timer 4 Clock Output Control
+                           000008   469 	T3R   	.equ	0x08	  ; b3, T3R    				; Timer 3 Run Control
+                           000004   470 	T3_CT 	.equ	0x04	  ; b2, T3_CT  				; Timer 3 Counter or Timer Mode Select
+                           000002   471 	T3x12 	.equ	0x02	  ; b1, T3x12  				; Timer 3 Clock x12 Prescaler Bypass
+                           000001   472 	T3CLKO	.equ	0x01	  ; b0, T3CLKO 				; Timer 3 Clock Output Control
+                                    473 
+                           0000D2   474 T4H .equ 0xD2                 ; Timer 4 High Byte (non bit addressable)
+                           0000D2   475 RL_TH4 .equ 0xD2              ; Reload Timer 4 High Byte
+                                    476 ;
+                           0000D3   477 T4L .equ 0xD3                 ; Timer 4 Low Byte
+                           0000D3   478 RL_TL4 .equ 0xD3              ; Reload Timer 4 Low Byte
+                                    479 ;
+                           0000D4   480 T3H .equ 0xD4                 ; Timer 3 High Byte (non bit addressable)
+                           0000D4   481 RL_TH3 .equ 0xD4              ; Reload Timer 3 High Byte
+                                    482 ;
+                           0000D5   483 T3L .equ 0xD5                 ; Timer 3 Low Byte
+                           0000D5   484 RL_TL3 .equ 0xD5              ; Reload Timer 3 Low Byte
+                                    485 
+                           0000D6   486 T2H .equ 0xD6                 ; Timer 2 High Byte (non bit addressable)
+                           0000D6   487 RL_TH2 .equ 0xD6              ; Reload Timer 2 High Byte
+                                    488 
+                           0000D7   489 T2L .equ 0xD7                 ; Timer 2 Low Byte
+                           0000D7   490 RL_TL2 .equ 0xD7              ; Reload Timer 2 Low Byte
+                                    491 
+                           0000D8   492 CCON .equ 0xD8                ; PCA Control Register (bit-Addressable)
+                           0000DF   493 	CF   	.equ 0xD8+7         ; PCA Flag
+                           0000DE   494 	CR   	.equ 0xD8+6         ; PCA Run
+                                    495 	; - 			
+                                    496 	; - 			
+                                    497 	; - 			
+                           0000DB   498 	CCF3 	.equ 0xD8+3         ; Capture Compare Flag 3
+                           0000DA   499 	CCF2 	.equ 0xD8+2         ; PCA Module 2 interrupt flag. Capture Compare Flag 2
+                           0000D9   500 	CCF1 	.equ 0xD8+1         ; PCA Module 1 interrupt flag. Capture Compare Flag 1
+                           0000D8   501 	CCF0 	.equ 0xD8+0         ; PCA Module 0 interrupt flag. Capture Compare Flag 0
+                                    502 
+                           0000D9   503 CMOD .equ 0xD9                ; PCA Working Mode Register (non bit addressable)
+                                    504 	;
+                           000080   505 	CIDL	.equ	0x80	  ; b7 CIDL					; PCA Counter Idle Mode Control
+                                    506 	;-		.equ	0x40	  ; b6 -
+                                    507 	;-		.equ	0x20	  ; b5 -
+                                    508 	;-		.equ	0x10	  ; b4 -
+                           000008   509 	CPS2	.equ	0x08	  ; b3 CPS2					; CPS2, CPS1, CPS0 : PCA Counter Pulse Select bits
+                           000004   510 	CPS1	.equ	0x04	  ; b2 CPS1					; PCA Counter Pulse Source Select 1
+                           000002   511 	CPS0	.equ	0x02	  ; b1 CPS0					; PCA Counter Pulse Source Select 0
+                           000001   512 	ECF 	.equ	0x01	  ; b0 ECF 					; PCA Enable Counter Overflow interrupt.
+                                    513 	
+                           0000DA   514 CCAPM0 .equ 0xDA              ; Compare Capture PWM 0 Mode (non bit addressable)
+                                    515 	;
+                                    516 	;		.equ	0x80	  ; b7 -
+                           000040   517 	ECOM0 	.equ	0x40	  ; b6 ECOM0  				; Enable Comparator 0
+                           000020   518 	CCAPP0	.equ	0x20	  ; b5 CCAPP0 				; PCA Capture Positive-going 0
+                           000010   519 	CCAPN0	.equ	0x10	  ; b4 CCAPN0 				; PCA Capture Negative-going 0
+                           000008   520 	MAT0  	.equ	0x08	  ; b3 MAT0   				; Match 0
+                           000004   521 	TOG0  	.equ	0x04	  ; b2 TOG0   				; Toggle 0
+                           000002   522 	PWM0  	.equ	0x02	  ; b1 PWM0   				; Pulse Width Modulator 0
+                           000001   523 	ECCF0 	.equ	0x01	  ; b0 ECCF0  				; Enable PCA Capture Flag 0
+                                    524 	
+                           0000DB   525 CCAPM1 .equ 0xDB;             ; Compare Capture PWM 1 Mode (non bit addressable)
+                                    526 	;
+                                    527 	;		.equ	0x80	  ; b7 -
+                           000040   528 	ECOM1 	.equ	0x40	  ; b6 ECOM1  				; Enable Comparator 1
+                           000020   529 	CCAPP1	.equ	0x20	  ; b5 CCAPP1 				; PCA Capture Positive-going 1
+                           000010   530 	CCAPN1	.equ	0x10	  ; b4 CCAPN1 				; PCA Capture Negative-going 1
+                           000008   531 	MAT1  	.equ	0x08	  ; b3 MAT1   				; Match 1
+                           000004   532 	TOG1  	.equ	0x04	  ; b2 TOG1   				; Toggle 1
+                           000002   533 	PWM1  	.equ	0x02	  ; b1 PWM1   				; Pulse Width Modulator 1
+                           000001   534 	ECCF1 	.equ	0x01	  ; b0 ECCF1  				; Enable PCA Capture Flag 1
+                                    535 
+                           0000DC   536 CCAPM2 .equ 0xDC;             ; Compare Capture PWM 2 Mode (non bit addressable)
+                                    537 	;
+                                    538 	;		.equ	0x80	  ; b7 -
+                           000040   539 	ECOM2 	.equ	0x40	  ; b6 ECOM2  				; Enable Comparator 2
+                           000020   540 	CCAPP2	.equ	0x20	  ; b5 CCAPP2 				; PCA Capture Positive-going 2
+                           000010   541 	CCAPN2	.equ	0x10	  ; b4 CCAPN2 				; PCA Capture Negative-going 2
+                           000008   542 	MAT2  	.equ	0x08	  ; b3 MAT2   				; Match 2
+                           000004   543 	TOG2  	.equ	0x04	  ; b2 TOG2   				; Toggle 2
+                           000002   544 	PWM2  	.equ	0x02	  ; b1 PWM2  					; Pulse Width Modulator 2
+                           000001   545 	ECCF2 	.equ	0x01	  ; b0 ECCF2  				; Enable PCA Capture Flag 2
+                                    546 
+                                    547 ; 0xDD	not used
+                                    548 ; 0xDE	not used
+                                    549 ; 0xDF	not used
+                                    550 
+                                    551 ; A	.equ 0xE0 ; located in ASxxxx Assembler V02.00 + NoICE + SDCC mods  (Intel 8051), page 1.
+                           0000E0   552 ACC .equ 0xE0                 ; Accumulator (Bit Addressable)
+                           0000E0   553 	ACC0 .equ 0xE0+0          ; Accumulator Bit 0
+                           0000E1   554 	ACC1 .equ 0xE0+1          ; Accumulator Bit 1
+                           0000E2   555 	ACC2 .equ 0xE0+2          ; Accumulator Bit 2
+                           0000E3   556 	ACC3 .equ 0xE0+3          ; Accumulator Bit 3
+                           0000E4   557 	ACC4 .equ 0xE0+4          ; Accumulator Bit 4
+                           0000E5   558 	ACC5 .equ 0xE0+5          ; Accumulator Bit 5
+                           0000E6   559 	ACC6 .equ 0xE0+6          ; Accumulator Bit 6
+                           0000E7   560 	ACC7 .equ 0xE0+7          ; Accumulator Bit 7
+                                    561 							  
+                           0000E1   562 P7M1 .equ 0xE1                ; P7M1 register (non bit addressable)
+                           0000E2   563 P7M0 .equ 0xE2                ; P7M0 register (non bit addressable)
+                                    564 		; Configure I/O ports mode
+                                    565 
+                                    566 ; 0xE3	not used
+                                    567 ; 0xE4	not used
+                                    568 ; 0xE5	not used
+                                    569 ; 0xE6	not used
+                                    570 ; 0xE7	not used
+                                    571 
+                           0000E8   572 P6 .equ 0xE8                  ; P6,	I/O port 6,	(Bit-Addressable)
+                           0000EF   573 	P67 .equ 0xE8+7             
+                           0000EE   574 	P66 .equ 0xE8+6             
+                           0000ED   575 	P65 .equ 0xE8+5             
+                           0000EC   576 	P64 .equ 0xE8+4             
+                           0000EB   577 	P63 .equ 0xE8+3             
+                           0000EA   578 	P62 .equ 0xE8+2             
+                           0000E9   579 	P61 .equ 0xE8+1             
+                           0000E8   580 	P60 .equ 0xE8+0             
+                                    581 	
+                           0000E9   582 CL .equ 0xE9                  ; PCA Counter Low Byte  (non bit addressable)
+                                    583 
+                           0000EA   584 CCAP0L .equ 0xEA              ; PCA Module 0 Capture/Compare Register Low Byte (non bit addressable)
+                                    585 
+                           0000EB   586 CCAP1L .equ 0xEB              ; PCA Module 1 Capture/Compare Register Low Byte (non bit addressable)
+                                    587 
+                           0000EC   588 CCAP2L .equ 0xEC              ; PCA Module 2 Capture/Compare Register Low Byte (non bit addressable)
+                                    589 
+                                    590 ; 0xED	not used
+                                    591 ; 0xEE	not used
+                                    592 ; 0xEF	not used
+                                    593 
+                           0000F0   594 B .equ 0xF0                   ; B Register (Bit-Addressable)
+                           0000F7   595 	B7 .equ 0xF0+7            ; B Bit 7
+                           0000F6   596 	B6 .equ 0xF0+6            ; B Bit 6
+                           0000F5   597 	B5 .equ 0xF0+5            ; B Bit 5
+                           0000F4   598 	B4 .equ 0xF0+4            ; B Bit 4
+                           0000F3   599 	B3 .equ 0xF0+3            ; B Bit 3
+                           0000F2   600 	B2 .equ 0xF0+2            ; B Bit 2
+                           0000F1   601 	B1 .equ 0xF0+1            ; B Bit 1
+                           0000F0   602 	B0 .equ 0xF0+0            ; B Bit 0
+                                    603 
+                                    604 ; 0xF1	not used
+                                    605 
+                           0000F2   606 PCA_PWM0 .equ 0xF2            ; PCA_PWM0 : PWM register of PCA module 0 (non bit addressable)
+                                    607 	;
+                           000080   608 	EBS0_1	.equ	0x80	  ; b7 EBS0_1	; Function Select bit when PCA module 0 work as Pulse Width Modulator (PWM)
+                           000040   609 	EBS0_0	.equ	0x40	  ; b6 EBS0_0	;
+                                    610 	;		.equ	0x20	  ; b5 -
+                                    611 	;		.equ	0x10	  ; b4 -
+                                    612 	;		.equ	0x08	  ; b3 -
+                                    613 	;		.equ	0x04	  ; b2 -
+                           000002   614 	EPC0H	.equ	0x02	  ; b1 EPC0H	; Associated with CCAP0H, it is used in PCA PWM mode.
+                           000001   615 	EPC0L	.equ	0x01	  ; b0 EPC0L	; Associated with CCAP0L, it is used in PCA PWM mode.
+                                    616 
+                           0000F3   617 PCA_PWM1 .equ 0xF3            ; Programmable Counter Array Module 1 PWM Register (non bit addressable)
+                                    618 	;
+                           000080   619 	EBS1_1	.equ	0x80	  ; b7 EBS1_1	; Function Select bit when PCA module 1 work as Pulse Width Modulator (PWM)
+                           000040   620 	EBS1_0	.equ	0x40	  ; b6 EBS1_0	; 
+                                    621 	;-		.equ	0x20	  ; b5 -
+                                    622 	;-		.equ	0x10	  ; b4 -
+                                    623 	;-		.equ	0x08	  ; b3 -
+                                    624 	;-		.equ	0x04	  ; b2 -
+                           000002   625 	EPC1H	.equ	0x02	  ; b1 EPC1H	; Associated with CCAP1H, it is used in PCA PWM mode.
+                           000001   626 	EPC1L	.equ	0x01	  ; b0 EPC1L	; Associated with CCAP1L, it is used in PCA PWM mode.
+                                    627 	
+                           0000F4   628 PCA_PWM2 .equ 0xF4            ; Programmable Counter Array Module 2 PWM Register (non bit addressable)
+                                    629 	;
+                           000080   630 	EBS2_1	.equ	0x80	  ; b7 EBS2_1	; Function Select bit when PCA module 1 work as Pulse Width Modulator (PWM)
+                           000040   631 	EBS2_0	.equ	0x40	  ; b6 EBS2_0	; 
+                                    632 	;		.equ	0x20	  ; b5 -
+                                    633 	;		.equ	0x10	  ; b4 -
+                                    634 	;		.equ	0x08	  ; b3 -
+                                    635 	;		.equ	0x04	  ; b2 -
+                           000002   636 	EPC2H	.equ	0x02	  ; b1 EPC2H	; Associated with CCAP1H, it is used in PCA PWM mode.
+                           000001   637 	EPC2L	.equ	0x01	  ; b0 EPC2L	; Associated with CCAP1L, it is used in PCA PWM mode.
+                                    638 	
+                                    639 ; 0xF5	not used
+                                    640 ; 0xF6	not used
+                                    641 ; 0xF7	not used
+                                    642 
+                           0000F8   643 P7 .equ 0xF8                  ; P7,	I/O port 7,	(Bit-Addressable)
+                           0000FF   644 	P77 .equ 0xF8+7             
+                           0000FE   645 	P76 .equ 0xF8+6             
+                           0000FD   646 	P75 .equ 0xF8+5             
+                           0000FC   647 	P74 .equ 0xF8+4             
+                           0000FB   648 	P73 .equ 0xF8+3             
+                           0000FA   649 	P72 .equ 0xF8+2             
+                           0000F9   650 	P71 .equ 0xF8+1             
+                           0000F8   651 	P70 .equ 0xF8+0             
+                                    652 	
+                           0000F9   653 CH .equ 0xF9                  ; PCA Counter High Byte
+                                    654 
+                           0000FA   655 CCAP0H .equ 0xFA              ; PCA Module 0 Capture/Compare Register High Byte
+                                    656 
+                           0000FB   657 CCAP1H .equ 0xFB              ; PCA Module 1 Capture/Compare Register High Byte
+                                    658 
+                           0000FC   659 CCAP2H .equ 0xFC              ; PCA Module 2 Capture/Compare Register High Byte
+                                    660 
+                                    661 ; 0xFD	not used
+                                    662 ; 0xFE	not used
+                                    663 ; 0xFF	not used
+                                    664 
+                                    665 
+                                    666 
+                                     31 
+                                     32 ;-----------------------------------------------------------------------
+                                     33 ; Software UART
+                                     34 ;-----------------------------------------------------------------------
+                           1517E70    35 MPU_CLK_HZ	.EQU		22118000			; 22.118MHz, 30.041 MHz Max
+                           000001    36 CLKDV		.EQU		1					; system clock No divide
+                           00000C    37 CLKDV12		.EQU		12					; system clock divide 12
+                                     38 
+                           0000B0    39 SW_RX		.EQU		P3.0				; MCU_RxD(P3.0), SW UART RX GPIO pin (must be /INT4)
+                           0000B1    40 SW_TX		.EQU		P3.1				; MCU_TxD(P3.1), SW UART TX GPIO pin (can be any GPIO pin)
+                           000000    41 RX_PROBE	.EQU		0					; 1: toggle P3.2 at every RX sample instant (scope trim)
+                           0000B2    42 PROBE_PIN	.EQU		P3.2
+                                     43 ;
+                           004B00    44 BAUD		.EQU		19200				; baud rate
+                           000480    45 BAUD_RATE	.EQU		(((MPU_CLK_HZ/CLKDV)+(BAUD/2))/BAUD)	; cycles per bit, rounded (1152)
+                                     46 ;
+                                     47 ; Latency corrections, in system clocks. Values are from the cycle-counted model
+                                     48 ; in sim/ (STC15 instruction timings, 6 clock interrupt entry). Trim on hardware
+                                     49 ; with RX_PROBE=1: the P3.2 edges must sit in the middle of the RX bit cells.
+                           00000D    50 TX_CORR		.EQU		13				; Timer2 overflow -> SW_TX edge, minus TX_TRANSMIT start-bit lead
+                           000000    51 RX_CORR		.EQU		0				; per-bit correction (should stay 0)
+                           000020    52 THALF_CORR	.EQU		32				; INT4 edge -> Timer0 start + Timer0 overflow -> SW_RX sample
+                                     53 ;
+                                     54 ; Timer0 is the Receive Clock, started on /INT4 runs asynchronously
+                                     55 ; Timer2 is the Transmit Clock, started by TX_TRANSMIT
+                                     56 ; Both timers are 16-bit auto-reload: written while stopped, TLx/THx load the counter
+                                     57 ; and the reload register; written while running, only the reload register.
+                           00FB80    58 TXBAUD		.EQU		(65536-BAUD_RATE)				; TX bit period
+                           00FB8D    59 TXBAUD_1ST	.EQU		(65536-(BAUD_RATE-TX_CORR))		; TX start bit period
+                           00FB80    60 RXBAUD		.EQU		(65536-(BAUD_RATE-RX_CORR))		; RX bit period
+                           00FDE0    61 RXBAUD_HLF	.EQU		(65536-((BAUD_RATE/2)-THALF_CORR))	; edge -> middle of start bit
+                                     62 ;
+                                     63 ; SWSCON: Software Serial Port Control (Bit-Addressable) Register
+                           000020    64 SWSCON		.EQU		0x20				; Serial Port Control Register
+                                     65 ; Bits
+                           000000    66 SWRI		.EQU		0x00			; Receive flag, set while RX buffer holds data (see RX_POLL)
+                           000001    67 SWTI		.EQU		0x01			; Transmit flag, set when the stop bit has been sent, cleared by TX_TRANSMIT
+                           000002    68 SWBRK		.EQU		0x02			; RX break signal (sticky, cleared by software)
+                           000003    69 SWBFF		.EQU		0x03			; RX buffer overflow, byte dropped (sticky, cleared by software)
+                           000004    70 SWREN		.EQU		0x04			; Serial reception enabled (RX_OPENBUFF / RX_CLOSEBUFF)
+                           000005    71 SRXBSY		.EQU		0x05			; Receiver Busy. "SWSM0"
+                           000006    72 STXBSY		.EQU		0x06			; Transmitter Busy. "SWSM1"
+                           000007    73 SWFE		.EQU		0x07			; Framing Error BIT (sticky, cleared by software)
+                                     74 ;
+                                     75 ; TX shift register, bit-addressable so the ISR can output bit 0 with MOV C,bit
+                           000021    76 TXBIN		.EQU		0x21			; TX BIT shift register
+                           000008    77 TXBIN0		.EQU		0x08			; bit address of TXBIN.0
+                                     78 ;
+                                     79 ; UART BYTE BUFFER
+                           000030    80 RXBIN		.EQU		0x30			; RX BIT accumulator
+                           000031    81 RXDATA		.EQU		0x31			; last byte returned by RX_POLL / RX_BLIND
+                           000033    82 TXDATA		.EQU		0x33			; TX Data Buffer
+                                     83 ;
+                                     84 ; UART STATE MACHINE
+                           000034    85 SURXST		.EQU		0x34			; receiver bit counter:   9 start, 8..1 data, 0 stop
+                           000035    86 SUTXST		.EQU		0x35			; transmitter bit counter: 10..1
+                                     87 ;
+                                     88 ; UART RX RING BUFFER
+                           000040    89 RXBUFFER	.EQU		0x40			; 0x40 - 0x4F Receive Buffer (16 byte aligned)
+                           00004F    90 RXBUFEND	.EQU		(RXBUFFER+0x0F)	; buffer end, also the wrap mask (15 bytes usable)
+                           000036    91 RXTAIL		.EQU		0x36			; read pointer, owned by RX_POLL
+                           000008    92 RXHEAD		.EQU		0x08			; write pointer = R0 of bank 1, owned by the RX ISR
+                                     93 ;
+                                     94 
+                                     95 ;=======================================================
+                                     96 ; Interrupt Vectors Table (ABS addresses 0x0000-0x002B)
+                                     97 ;=======================================================
+                                     98 .area VECTOR    (CODE)
+                                     99 .area INTV (ABS)				; allow .org defines
+                                    100 
+                                    101 		;; --- Rest Vector  ---
+      000000                        102 		.ORG    0x0000
+      000000 02r01r00         [24]  103 		LJMP    _START
+                                    104 
+                                    105 		;; --- Externa 0 Interrupt (INT0) ---
+                                    106 		.area INT0 (ABS,CODE)
+      000003                        107 		.ORG    0x0003
+      000003 32               [24]  108 		RETI
+                                    109 
+                                    110 		;; --- Timer 0 Interrupt (TF0) ---
+                                    111 		.area TMR0 (ABS,CODE)
+      00000B                        112 		.ORG    0x000B
+      00000B 02r01r9F         [24]  113 		LJMP	_TIMER0_ISR
+                                    114 
+                                    115 		;; --- Externa 1 Interrupt (INT1) ---
+                                    116 		.area INT1 (ABS,CODE)
+      000013                        117 		.ORG    0x0013
+      000013 32               [24]  118 		RETI
+                                    119 
+                                    120 		;; --- Externa 2 Interrupt (INT2) ---
+                                    121 		.area INT2 (ABS,CODE)
+      000053                        122 		.ORG    0x0053
+      000053 32               [24]  123 		RETI
+                                    124 
+                                    125 		;; --- Externa 3 Interrupt (INT3) ---
+                                    126 		.area INT3 (ABS,CODE)
+      00005B                        127 		.ORG    0x005B
+      00005B 32               [24]  128 		RETI
+                                    129 
+                                    130 		;; --- Timer 2 Interrupt (TF2) ---
+                                    131 		.area TMR2 (ABS,CODE)
+      000063                        132 		.ORG    0x0063      ; Timer 2
+      000063 02r02r0F         [24]  133 		LJMP   _TIMER2_ISR
+                                    134 
+                                    135 		;; --- Externa 4 Interrupt (INT4) ---
+                                    136 		.area INT4 (ABS,CODE)
+      000083                        137 		.ORG    0x0083
+      000083 02r01r86         [24]  138 		LJMP   _INT4_ISR
+                                    139 
+                                    140 
+                                    141 ; ============================================================
+                                    142 ;				MAIN PROGRAM CODE
+                                    143 ; ============================================================
+                                    144 .AREA CSEG (ABS,CODE) ; ABSOLUTE ADDRESS, debugging
+      000100                        145 .ORG 0X0100
+                                    146 
+      000100                        147 _START:
+                                    148 
+                                    149 			; INITIALIZE STACK POINTER
+      000100 75 81 60         [24]  150 			MOV SP, 	#0x60           ; set stack pointer STACK TEST, 32 byte stack
+      000103 53 D0 E7         [24]  151 			ANL	PSW,	#(~0x18)		; Bank zero(0)
+                                    152 
+      000106r01r14            [24]  153 			ACALL	UART_INIT			; bit-bang uart configuration
+      000108r01r40            [24]  154 			ACALL	RX_OPENBUFF			; receiver runs from now on, in the background
+                                    155 
+      00010A                        156 _START00:
+                                    157 
+      00010Ar01r7B            [24]  158 			ACALL	RX_BLIND			; call is blocking, A = data
+                                    159 
+                                    160 			; echo back data
+      00010C F5 33            [12]  161 			MOV	TXDATA,	A
+      00010E                        162 TX_RETRY:
+      00010Er01rEA            [24]  163 			ACALL	TX_TRANSMIT
+      000110 40 FC            [24]  164 			JC	TX_RETRY				; transmitter busy with previous byte, retry
+                                    165 
+      000112 80 F6            [24]  166 			SJMP	_START00
+                                    167 
+                                    168 
+                                    169 
+                                    170 ;=======================================================================
+                                    171 ;				UART BIT BANG DRIVER
+                                    172 ;=======================================================================
+                                    173 ; Resources:  Timer0 + INT4 (RX), Timer2 (TX), register bank 1 R0 (RX ISR),
+                                    174 ;             IRAM 0x20-0x21, 0x30-0x36, 0x40-0x4F.
+                                    175 ; Callers run in register bank 0.
+                                    176 
+                                    177 
+                                    178 ;========================================================================
+                                    179 ;						UART INITIALIZATION
+                                    180 ;========================================================================
+      000114                        181 UART_INIT:
+                                    182 			; SW_RX		.EQU		P3.0				; MCU_RxD(P3.0), SW UART RX GPIO pin (must be /INT4)
+                                    183 			; SW_TX		.EQU		P3.1				; MCU_TxD(P3.1), SW UART TX GPIO pin (can be any GPIO pin)
+                                    184 			; P3M1[7 : 0]	P3M0 [7 : 0]
+                                    185 			; 		1			0			P3.0 input-only (high-impedance )
+                                    186 			;MOV	P3M1,	#0b00000001			;
+                                    187 			;MOV	P3M0,	#0b00000000			;
+                                    188 
+      000114 D2 B1            [12]  189 			SETB	SW_TX					; set TX output MARK
+      000116 75 20 00         [24]  190 			MOV		SWSCON,	#0x00			; all flags clear, RX disabled, TX idle
+                                    191 
+      000119 75 36 40         [24]  192 			MOV		RXTAIL,	#RXBUFFER		; empty receive ring
+      00011C 75 08 40         [24]  193 			MOV		RXHEAD,	#RXBUFFER
+                                    194 
+                                    195 			;--------------- Configure System Clock Source -------------
+      00011F 53 97 F8         [24]  196 			ANL CLK_DIV,	#(~(CLKS2|CLKS1|CLKS0))			; set system clock divider/1
+                                    197 
+                                    198 			;------------------ INT4 -----------------------------------
+      000122 53 8F BF         [24]  199 			ANL		AUXR2,	#(~EX4)			; disabled until RX_OPENBUFF
+                                    200 
+                                    201 			;------------------ Configure Timer 0 (RX) ------------------
+      000125 C2 8C            [12]  202 			CLR		TR0						; STOP
+      000127 53 89 F0         [24]  203 			ANL		TMOD,	#0xF0			; Timer0 mode 0 (16 bit auto-reload), timer, no gate
+      00012A 43 8E 80         [24]  204 			ORL		AUXR,	#T0x12			; Timer 0 in 1T mode
+      00012D C2 8D            [12]  205 			CLR		TF0
+      00012F 43 B8 02         [24]  206 			ORL		IP,		#PT0			; high priority: RX sampling preempts TX and INT4
+      000132 D2 A9            [12]  207 			SETB	ET0						; only runs while a frame is being received
+                                    208 
+                                    209 			;------------------ Configure Timer 2 (TX) -------------------
+      000134 53 8E EF         [24]  210 			ANL		AUXR,	#(~T2R)			; Timer2 stop
+      000137 43 8E 04         [24]  211 			ORL		AUXR,	#T2x12			; T2 in 1T mode, clock source SYSCLK/1
+      00013A 43 AF 04         [24]  212 			ORL		IE2,	#ET2			; only runs while a frame is being sent
+                                    213 
+      00013D D2 AF            [12]  214 			SETB	EA						; Go Live!
+                                    215 
+      00013F 22               [24]  216 			RET
+                                    217 
+                                    218 
+                                    219 ;=======================================================================
+                                    220 ; 						OPEN, ALLOW UART RECEPTION
+                                    221 ; Received bytes are buffered, 15 bytes max, with overflow detection (SWBFF)
+                                    222 ;=======================================================================
+      000140                        223 RX_OPENBUFF:
+      000140 C2 07            [12]  224 			CLR		SWFE					; clear framing error
+      000142 C2 02            [12]  225 			CLR		SWBRK					; clear line break
+      000144 C2 03            [12]  226 			CLR		SWBFF					; clear overflow
+      000146 D2 04            [12]  227 			SETB	SWREN					; RX enabled
+      000148 43 8F 40         [24]  228 			ORL		AUXR2,	#EX4			; arm start-bit detection
+      00014B 22               [24]  229 			RET
+                                    230 
+                                    231 ;=======================================================================
+                                    232 ;				CLOSE, DISABLE UART RECEPTION
+                                    233 ; Buffered bytes stay readable with RX_POLL / RX_BLIND.
+                                    234 ;=======================================================================
+      00014C                        235 RX_CLOSEBUFF:
+      00014C 53 8F BF         [24]  236 			ANL		AUXR2,	#(~EX4)			; no new frames
+      00014F C2 8C            [12]  237 			CLR		TR0						; abort frame in progress
+      000151 C2 05            [12]  238 			CLR		SRXBSY
+      000153 C2 04            [12]  239 			CLR		SWREN
+      000155 22               [24]  240 			RET
+                                    241 
+                                    242 ;=======================================================================
+                                    243 ; 						RX POLL, NON BLOCKING
+                                    244 ; out:	C=1  buffer empty
+                                    245 ;		C=0  A = RXDATA = received byte
+                                    246 ; uses R0 (restored)
+                                    247 ;=======================================================================
+      000156                        248 RX_POLL:
+      000156 C2 00            [12]  249 			CLR		SWRI					; ISR sets it again for a byte arriving from here on
+      000158 E5 36            [12]  250 			MOV		A,	RXTAIL
+      00015A B5 08 02         [24]  251 			CJNE	A,	RXHEAD,	RX_POLL1	; tail != head: data available
+      00015D D3               [12]  252 			SETB	C
+      00015E 22               [24]  253 			RET
+      00015F                        254 RX_POLL1:
+      00015F C0 00            [24]  255 			PUSH	0x00					; R0 bank(0)
+      000161 F8               [12]  256 			MOV		R0,	A					; R0 -> oldest byte
+      000162 04               [12]  257 			INC		A
+      000163 54 4F            [12]  258 			ANL		A,	#RXBUFEND			; wrap
+      000165 C0 E0            [24]  259 			PUSH	ACC						; new tail
+      000167 E6               [12]  260 			MOV		A,	@R0					; data
+      000168 D0 36            [24]  261 			POP		RXTAIL					; release the slot only after reading it
+      00016A F5 31            [12]  262 			MOV		RXDATA,	A
+      00016C D0 00            [24]  263 			POP		0x00
+                                    264 
+      00016E E5 36            [12]  265 			MOV		A,	RXTAIL				; more data left? keep SWRI set
+      000170 B5 08 02         [24]  266 			CJNE	A,	RXHEAD,	RX_POLL2
+      000173 80 02            [24]  267 			SJMP	RX_POLL3
+      000175                        268 RX_POLL2:
+      000175 D2 00            [12]  269 			SETB	SWRI
+      000177                        270 RX_POLL3:
+      000177 E5 31            [12]  271 			MOV		A,	RXDATA
+      000179 C3               [12]  272 			CLR		C
+      00017A 22               [24]  273 			RET
+                                    274 
+                                    275 ;=======================================================================
+                                    276 ; 						RX SIMPLE RECEIVE, BLOCKING
+                                    277 ; out:	A = RXDATA = received byte
+                                    278 ;		C = SWFE | SWBRK | SWBFF, error flags are sticky, clear at application level
+                                    279 ;=======================================================================
+      00017B                        280 RX_BLIND:
+      00017Br01r56            [24]  281 			ACALL	RX_POLL
+      00017D 40 FC            [24]  282 			JC		RX_BLIND				; wait for data
+      00017F A2 07            [12]  283 			MOV		C,	SWFE				; indicate error state
+      000181 72 02            [24]  284 			ORL		C,	SWBRK
+      000183 72 03            [24]  285 			ORL		C,	SWBFF
+      000185 22               [24]  286 			RET
+                                    287 
+                                    288 
+                                    289 ;=======================================================================
+                                    290 ;				UART RECEIVER INTERRUPT SERVICE INT4 & TIMER 0
+                                    291 ;=======================================================================
+                                    292 ; INT4: leading (falling) edge of the start bit. Starts Timer0 so that its first
+                                    293 ; overflow falls in the middle of the start bit, every following one a bit time
+                                    294 ; later. No registers or flags are touched, so nothing needs saving.
+      000186                        295 _INT4_ISR:
+      000186 75 8A E0         [24]  296 			MOV		TL0,	#(RXBAUD_HLF & 0xFF)	; (3) Timer0 stopped: counter and reload
+      000189 75 8C FD         [24]  297 			MOV		TH0,	#(RXBAUD_HLF >> 8)		; (3)
+      00018C D2 8C            [12]  298 			SETB	TR0								; (3) running, first overflow at mid start bit
+      00018E 75 8A 80         [24]  299 			MOV		TL0,	#(RXBAUD & 0xFF)		; running: reload register only,
+      000191 75 8C FB         [24]  300 			MOV		TH0,	#(RXBAUD >> 8)			; 1 bit time for the following overflows
+      000194 C2 8D            [12]  301 			CLR		TF0
+      000196 53 8F BF         [24]  302 			ANL		AUXR2,	#(~EX4)			; ignore data edges until the stop bit
+      000199 75 34 09         [24]  303 			MOV		SURXST,	#9				; next Timer0 overflow: start bit check
+      00019C D2 05            [12]  304 			SETB	SRXBSY
+      00019E 32               [24]  305 			RETI
+                                    306 
+                                    307 ;-----------------------------------------------------------------------------
+                                    308 ; Timer0: one interrupt per bit cell, SURXST counts down
+                                    309 ;	9     middle of start bit, abort if the line is MARK again (glitch)
+                                    310 ;	8..1  data b0..b7
+                                    311 ;	0     stop bit, deliver byte
+                                    312 ;-----------------------------------------------------------------------------
+      00019F                        313 _TIMER0_ISR:
+      00019F C0 D0            [24]  314 			PUSH	PSW						; (3)
+      0001A1 A2 B0            [12]  315 			MOV		C,	SW_RX				; (2) sample RX, fixed delay after the overflow
+                           000000   316 		.if RX_PROBE
+                                    317 			CPL		PROBE_PIN				; scope: marks the sampling instant
+                                    318 		.endif
+      0001A3 C0 E0            [24]  319 			PUSH	ACC
+                                    320 
+      0001A5 E5 34            [12]  321 			MOV		A,	SURXST
+      0001A7 60 1B            [24]  322 			JZ		SWRX_STOP				; stop bit
+      0001A9 15 34            [12]  323 			DEC		SURXST
+      0001AB 64 09            [12]  324 			XRL		A,	#9					; XRL/JZ leave the sample in C untouched
+      0001AD 60 0A            [24]  325 			JZ		SWRX_START				; start bit
+                                    326 
+      0001AF E5 30            [12]  327 			MOV		A,	RXBIN				; data bit: right shift Carry into shift register
+      0001B1 13               [12]  328 			RRC		A
+      0001B2 F5 30            [12]  329 			MOV		RXBIN,	A
+                                    330 
+      0001B4                        331 TIMER0_ISR_RXEND:
+      0001B4 D0 E0            [24]  332 			POP		ACC
+      0001B6 D0 D0            [24]  333 			POP		PSW
+      0001B8 32               [24]  334 			RETI
+                                    335 
+      0001B9                        336 SWRX_START:
+      0001B9 50 F9            [24]  337 			JNC		TIMER0_ISR_RXEND		; still SPACE: good start bit
+      0001BB C2 8C            [12]  338 			CLR		TR0						; false start (noise), back to idle
+      0001BD C2 05            [12]  339 			CLR		SRXBSY
+      0001BF 43 8F 40         [24]  340 			ORL		AUXR2,	#EX4
+      0001C2 80 F0            [24]  341 			SJMP	TIMER0_ISR_RXEND
+                                    342 
+                                    343 ;------------------------------------------------------------------------------------
+                                    344 ; STOP BIT, Framing Error  Detection if-then Break Detection
+                                    345 ;------------------------------------------------------------------------------------
+      0001C4                        346 SWRX_STOP:
+      0001C4 C2 8C            [12]  347 			CLR		TR0						; frame complete, Timer0 stop
+      0001C6 43 8F 40         [24]  348 			ORL		AUXR2,	#EX4			; re-arm start-bit detection (mid stop bit). If the
+                                    349 											; line is still SPACE (error/BREAK) the next falling
+                                    350 											; edge only comes after it returned to MARK
+      0001C9 C2 05            [12]  351 			CLR		SRXBSY
+      0001CB 40 08            [24]  352 			JC		SWRX_PUT				; stop bit is MARK, valid frame
+      0001CD D2 07            [12]  353 			SETB	SWFE					; flag Framing Error
+      0001CF E5 30            [12]  354 			MOV		A,	RXBIN
+      0001D1 70 02            [24]  355 			JNZ		SWRX_PUT
+      0001D3 D2 02            [12]  356 			SETB	SWBRK					; all zero + no stop bit: BREAK
+      0001D5                        357 SWRX_PUT:
+      0001D5 75 D0 08         [24]  358 			MOV		PSW,	#0x08			; bank 1, R0 = RXHEAD (PSW restored on exit)
+      0001D8 E8               [12]  359 			MOV		A,	R0
+      0001D9 04               [12]  360 			INC		A
+      0001DA 54 4F            [12]  361 			ANL		A,	#RXBUFEND			; wrap
+      0001DC B5 36 04         [24]  362 			CJNE	A,	RXTAIL,	SWRX_PUT1	; next head == tail: buffer full
+      0001DF D2 03            [12]  363 			SETB	SWBFF					; overflow, byte dropped
+      0001E1 80 D1            [24]  364 			SJMP	TIMER0_ISR_RXEND
+      0001E3                        365 SWRX_PUT1:
+      0001E3 A6 30            [24]  366 			MOV		@R0,	RXBIN			; store byte
+      0001E5 F8               [12]  367 			MOV		R0,	A					; then publish it
+      0001E6 D2 00            [12]  368 			SETB	SWRI					; data available
+      0001E8 80 CA            [24]  369 			SJMP	TIMER0_ISR_RXEND
+                                    370 
+                                    371 
+                                    372 ;=======================================================================
+                                    373 ;  TX UART TRANSMISSION
+                                    374 ;=======================================================================
+                                    375 
+                                    376 ;=======================================================================
+                                    377 ; 						TRANSMIT ONE BYTE
+                                    378 ; in:	TXDATA
+                                    379 ; out:	C=1 transmitter busy, nothing done (retry)
+                                    380 ;		C=0 transmission started, STXBSY set until the stop bit is complete
+                                    381 ;=======================================================================
+      0001EA                        382 TX_TRANSMIT:
+                                    383 
+      0001EA D3               [12]  384 			SETB	C						; set error, cleared if routine runs OK
+      0001EB 20 06 20         [24]  385 			JB		STXBSY,	TX_TRANSMIT_EXIT	; TX already busy, can not transmit
+                                    386 
+      0001EE D2 06            [12]  387 			SETB	STXBSY					; indicate TX busy
+      0001F0 C2 01            [12]  388 			CLR		SWTI					; transmission not complete
+      0001F2 85 33 21         [24]  389 			MOV		TXBIN,	TXDATA			; byte into shift register
+      0001F5 75 35 0A         [24]  390 			MOV		SUTXST,	#10				; 8 data + stop + end of stop
+                                    391 
+      0001F8 75 D7 8D         [24]  392 			MOV		T2L,	#(TXBAUD_1ST & 0xFF)	; Timer2 stopped: counter and reload
+      0001FB 75 D6 FB         [24]  393 			MOV		T2H,	#(TXBAUD_1ST >> 8)		; start bit period
+                                    394 
+      0001FE C2 AF            [12]  395 			CLR		EA						; keep timer start and start bit edge together
+      000200 43 8E 10         [24]  396 			ORL		AUXR,	#T2R			; T2 start to run
+      000203 C2 B1            [12]  397 			CLR		SW_TX					; START bit
+      000205 D2 AF            [12]  398 			SETB	EA
+                                    399 
+      000207 75 D7 80         [24]  400 			MOV		T2L,	#(TXBAUD & 0xFF)		; running: reload register only
+      00020A 75 D6 FB         [24]  401 			MOV		T2H,	#(TXBAUD >> 8)			; data/stop bit period
+                                    402 
+      00020D C3               [12]  403 			CLR		C						; indicate success
+                                    404 
+      00020E                        405 TX_TRANSMIT_EXIT:
+                                    406 
+      00020E 22               [24]  407 			RET
+                                    408 
+                                    409 ;=======================================================================
+                                    410 ;  TIMER 2 INTERRUPT, TX UART TRANSMISSION
+                                    411 ;=======================================================================
+                                    412 ; SUTXST 10..3  output b0..b7
+                                    413 ;        2      output stop bit (MARK was shifted in behind the data)
+                                    414 ;        1      end of stop bit: stop Timer2, transmitter free
+      00020F                        415 _TIMER2_ISR:
+      00020F C0 D0            [24]  416 			PUSH	PSW						; (3)
+      000211 A2 08            [12]  417 			MOV		C,	TXBIN0				; (2) bit for this cell was prepared last time
+      000213 92 B1            [24]  418 			MOV		SW_TX,	C				; (3) output bit on GPIO pin, fixed delay
+      000215 C0 E0            [24]  419 			PUSH	ACC
+                                    420 
+      000217 E5 21            [12]  421 			MOV		A,	TXBIN				; prepare next bit
+      000219 D3               [12]  422 			SETB	C						; shift a STOP bit into MSB
+      00021A 13               [12]  423 			RRC		A
+      00021B F5 21            [12]  424 			MOV		TXBIN,	A
+                                    425 
+      00021D D5 35 07         [24]  426 			DJNZ	SUTXST,	TIMER2_ISR_TXEND
+                                    427 
+      000220 53 8E EF         [24]  428 			ANL		AUXR,	#(~T2R)			; T2 STOP! Stop bit sent.
+      000223 C2 06            [12]  429 			CLR		STXBSY					; transmitter available
+      000225 D2 01            [12]  430 			SETB	SWTI					; transmit complete
+                                    431 
+      000227                        432 TIMER2_ISR_TXEND:
+      000227 D0 E0            [24]  433 			POP		ACC
+      000229 D0 D0            [24]  434 			POP		PSW
+      00022B 32               [24]  435 			RETI
+                                    436 
+                                    437 
+                                    438 ;-----------------------------------------------------------------------
+                                    439 ;						END BIT-BANG UART
+                                    440 ;-----------------------------------------------------------------------
+                                    441 
+                                    442 
+                                    443 ;=======================================================================
+                                    444 ;					END OF PROGRAM
+                                    445 ;=======================================================================
+                                    446 

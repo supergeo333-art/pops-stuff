@@ -7,6 +7,8 @@
 | `stc15w-sdcc.inc` | your STC15W SFR header |
 | `sim/sim8051.py` | cycle-counted 8051 simulator, STC15 1T timings, Timer0/Timer2 auto-reload, INT4, 2-level priority |
 | `sim/tb.py` | test bench: drives P3.0, decodes P3.1, checks the echo |
+| `REPORT.md` | full report: bugs, techniques, timing analysis, 33 MHz, header review |
+| `listings/` | assembler listings and .ihx images for both drivers at 22.118 and 33 MHz |
 
 ```
 sudo apt install sdcc          # sdas8051 + sdld
@@ -64,7 +66,7 @@ python3 tb.py ../uart_drv.asm --fosc 33000000 --baud 38400      # any clock / ba
 | worst TX edge error, full duplex | — | 7.4 % (at +2 %) | 5.7 % |
 | ISR length INT4 / T0 / T2 (cycles) | 111 / 72–91 / 74–77 | | 41 / 44–66 / 40–49 |
 | CPU load while echoing | 9.6 % | | 5.6 % |
-| code (main + driver) | 396 B | | 299 B |
+| code (main + driver) | 396 B | | 300 B |
 
 Remaining TX jitter: the RX stop-bit ISR (66 cycles) can delay a TX edge when they
 coincide, because Timer2 cannot be made high priority on STC15. 5.7% of a bit is
