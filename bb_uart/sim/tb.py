@@ -12,14 +12,28 @@ and compared with what was sent.
 """
 import os
 import random
+import re
 import subprocess
 import sys
 
 from sim8051 import STC15, Fault, Line, load_ihx, parse_listing
 
-FOSC = 22118400          # the simulated oscillator
-BAUD = 19200
-T_NOM = FOSC / BAUD      # 1152 cycles per bit
+FOSC = 22118400          # the simulated oscillator (--fosc)
+BAUD = 19200             # (--baud)
+T_NOM = FOSC / BAUD      # cycles per bit
+INC_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # stc15w-sdcc.inc
+
+
+def variant(asm, fosc, baud):
+    """Copy of asm with MPU_CLK_HZ / BAUD replaced, in build/."""
+    src = open(asm).read()
+    src = re.sub(r'^(MPU_CLK_HZ\s+\.EQU\s+)\d+', r'\g<1>%d' % fosc, src, count=1, flags=re.M | re.I)
+    src = re.sub(r'^(BAUD\s+\.EQU\s+)\d+', r'\g<1>%d' % baud, src, count=1, flags=re.M | re.I)
+    out = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'build')
+    os.makedirs(out, exist_ok=True)
+    path = os.path.join(out, '%s_%d_%d.asm' % (os.path.splitext(os.path.basename(asm))[0], fosc, baud))
+    open(path, 'w').write(src)
+    return path
 
 
 def build(asm):
@@ -27,7 +41,7 @@ def build(asm):
     out = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'build')
     os.makedirs(out, exist_ok=True)
     rel = os.path.join(out, base + '.rel')
-    subprocess.run(['sdas8051', '-plosgff', '-I' + d, rel, os.path.abspath(asm)], check=True, cwd=d)
+    subprocess.run(['sdas8051', '-plosgff', '-I' + INC_DIR, rel, os.path.abspath(asm)], check=True, cwd=d)
     subprocess.run(['sdld', '-n', '-i', os.path.join(out, base + '.ihx'), rel], check=True)
     return (load_ihx(os.path.join(out, base + '.ihx')),) + parse_listing(os.path.join(out, base + '.lst'))
 
@@ -140,11 +154,20 @@ def check(name, ok, detail=''):
 
 
 def main(asm):
-    prog = build(asm)
+    prog = build(variant(asm, FOSC, BAUD))
     print('=' * 78)
-    print('Firmware: %s' % os.path.basename(asm))
+    print('Firmware: %s   @ %.4f MHz, %d baud (%.2f cycles/bit)' % (
+        os.path.basename(asm), FOSC / 1e6, BAUD, T_NOM))
     print('=' * 78)
     results = []
+
+    # 0 ------------------------------------------------------------ init state
+    h = Host(); h.idle(3)
+    r = Run(prog, h, t_end=3 * T_NOM)
+    sw, ip = r.cpu.iram[0x20], r.cpu.sfr[0xB8]
+    results.append(check('init: no stray SWSCON flags, Timer0 priority as configured',
+                         not r.fault and (sw & ~0x10) == 0,
+                         r.fault or 'SWSCON=%02X IP=%02X' % (sw, ip)))
 
     # 1 ------------------------------------------------------------ gapped echo
     h = Host()
@@ -280,7 +303,15 @@ def main(asm):
 
 
 if __name__ == '__main__':
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument('asm', nargs='+')
+    ap.add_argument('--fosc', type=int, default=FOSC, help='system clock, Hz')
+    ap.add_argument('--baud', type=int, default=BAUD)
+    a = ap.parse_args()
+    FOSC, BAUD = a.fosc, a.baud
+    T_NOM = FOSC / BAUD
     ok = True
-    for a in sys.argv[1:]:
-        ok &= main(a)
+    for f in a.asm:
+        ok &= main(f)
     sys.exit(0 if ok else 1)

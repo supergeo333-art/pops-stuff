@@ -203,7 +203,7 @@ UART_INIT:
 			ANL		TMOD,	#0xF0			; Timer0 mode 0 (16 bit auto-reload), timer, no gate
 			ORL		AUXR,	#T0x12			; Timer 0 in 1T mode
 			CLR		TF0
-			SETB	PT0						; high priority: RX sampling preempts TX and INT4
+			ORL		IP,		#PT0			; high priority: RX sampling preempts TX and INT4
 			SETB	ET0						; only runs while a frame is being received
 
 			;------------------ Configure Timer 2 (TX) -------------------

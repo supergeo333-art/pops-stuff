@@ -4,13 +4,14 @@
 |---|---|
 | `uart_drv_orig.asm` | driver as received |
 | `uart_drv.asm` | fixed + optimized driver (same API, same echo `main`) |
-| `stc15w-sdcc.inc` | minimal SFR header (only the symbols the driver uses) — replace with your full header |
+| `stc15w-sdcc.inc` | your STC15W SFR header |
 | `sim/sim8051.py` | cycle-counted 8051 simulator, STC15 1T timings, Timer0/Timer2 auto-reload, INT4, 2-level priority |
 | `sim/tb.py` | test bench: drives P3.0, decodes P3.1, checks the echo |
 
 ```
 sudo apt install sdcc          # sdas8051 + sdld
 cd sim && python3 tb.py ../uart_drv.asm ../uart_drv_orig.asm
+python3 tb.py ../uart_drv.asm --fosc 33000000 --baud 38400      # any clock / baud
 ```
 
 ## Bugs found in the original
@@ -60,7 +61,7 @@ cd sim && python3 tb.py ../uart_drv.asm ../uart_drv_orig.asm
 | 400 bytes with host 4 % fast | crash | 109 lost, desync | 3 dropped, `SWBFF`=1, rest in order |
 | RX sample point (idle traffic) | 0.544–0.556 bit | same | 0.498–0.503 bit |
 | RX baud tolerance (gapped) | −5.0 / +5.5 % | same | ±5.5 % |
-| worst TX edge error, full duplex | — | 7.4 % | 5.7 % |
+| worst TX edge error, full duplex | — | 7.4 % (at +2 %) | 5.7 % |
 | ISR length INT4 / T0 / T2 (cycles) | 111 / 72–91 / 74–77 | | 41 / 44–66 / 40–49 |
 | CPU load while echoing | 9.6 % | | 5.6 % |
 | code (main + driver) | 396 B | | 299 B |
@@ -68,6 +69,49 @@ cd sim && python3 tb.py ../uart_drv.asm ../uart_drv_orig.asm
 Remaining TX jitter: the RX stop-bit ISR (66 cycles) can delay a TX edge when they
 coincide, because Timer2 cannot be made high priority on STC15. 5.7% of a bit is
 well inside a receiver's margin.
+
+## 33 MHz analysis
+
+To run at 33 MHz, change one line: `MPU_CLK_HZ .EQU 33000000`. The correction constants are in
+clock cycles, so they don't change with the clock.
+
+* Divisor: 33 000 000 / 19200 = 1718.75, rounded to 1719 (+0.015 % baud error; truncating gives 1718, −0.044 %).
+  All timer reload values fit in 16 bits (half bit = 859).
+* **Your own header comment gives 30.041 MHz as the maximum.** Check that the STC-ISP tool
+  and your part's datasheet allow 33 MHz for the IRC before relying on it.
+
+New driver at 33 MHz (simulator):
+
+| baud | cycles/bit | checks | RX sample range | worst TX edge (full duplex) | notes |
+|---|---|---|---|---|---|
+| 19200 | 1718.75 | 17/17 | 0.498–0.503 | 42 cyc = 2.4 % (5.7 % at 22.1 MHz) | CPU load 3.8 % (5.6 % at 22.1 MHz) |
+| 38400 | 859.4 | 17/17 | 0.492–0.504 | < 10 % | clean |
+| 57600 | 572.9 | 16/17 | 0.494–0.506 | < 10 % | fails only the 4 %-fast back-to-back stress test (20 of 400 dropped; ±2 % passes) |
+| 76800 | 429.7 | 15/17 | 0.495–0.518 | 15.9 % | echo still correct; jitter over budget |
+| 115200 | 286.5 | 10/17 | 0.474–0.635 | 21.8 % | too fast for a bit-bang UART on this core |
+
+The limit comes from the fixed ISR lengths (INT4 41, Timer0 44–66, Timer2 40–49 cycles).
+When two ISRs collide, one delays the other by up to that much. Keep that under
+about 10 % of a bit, i.e. ≥ 600 cycles/bit. **At 33 MHz, 38400 is fully clean and 57600
+is usable** with normal ±2 % clocks. 19200 has large margins.
+
+The original driver at 33 MHz / 19200 behaves the same as at 22.1 MHz: it crashes at 0x258 in 9 of 15
+tests, and with the table fix it still loses back-to-back bytes (7/64). Its fixed `THALF_CORR = 51` also
+drifts the sample point later as the baud rate rises (0.60 at 57600, 0.70 at 115200).
+
+## Header (`stc15w-sdcc.inc`) findings
+
+* **`PT0` (and all of `IP`, `IP2`, `IE2`, `AUXR`, …) are byte masks, not bit addresses.**
+  `SETB PT0` assembles silently to `SETB 0x02`, which sets bit 2 of IRAM 0x20 (`SWBRK` here).
+  The driver now uses `ORL IP,#PT0`. The same trap applies to any `SETB`/`CLR` on these names.
+  The bench now checks that no stray flags are set after init.
+* `GATE`, `M1`, `M0` are defined twice (Timer1 then Timer0 values). The last definition wins, so
+  the Timer1 masks are lost.
+* `PS2` is defined twice (IP2 = 0x01, WDT_CONTR = 0x04). The last wins, so `ORL IP2,#PS2` would set the wrong bit.
+* `IAP_ADDRH` is defined as both 0xC3 and 0xC4, and `IAP_ADDRL` is missing. 0xC4 should be
+  `IAP_ADDRL`/`ISP_ADDRL`. As written, IAP code writes the high address to the low register.
+* `S3REN .equ 0x20` duplicates `S3SM2`. It should be 0x10. The S3CON bit comments are also numbered backwards.
+* Cosmetic: P1/P2/P3/P5 comments say "I/O port 0". `BRT` (0x9C) is not an STC15 register.
 
 ## Model assumptions (confirm on hardware)
 
